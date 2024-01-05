@@ -1,0 +1,20 @@
+[package]
+name = "mekka_synth"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+moddef = "0.2.2"
+vst = "0.4.0"
+real_time_fir_iir_filters = "0.6.7"
+array_math = "0.2.5"
+rand = "0.8.5"
+num = "0.4.1"
+serde_scala = "0.1.2"
+vst_window = "0.3.0"
+
+[lib]
+name = "mekka_synth"
+crate-type = ["cdylib"]
