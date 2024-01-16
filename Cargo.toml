@@ -13,7 +13,6 @@ array_math = "0.2.5"
 rand = "0.8.5"
 num = "0.4.1"
 serde_scala = "0.1.2"
-vst_window = "0.3.0"
 
 [lib]
 name = "mekka_synth"
