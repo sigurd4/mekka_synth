@@ -1,6 +1,5 @@
-use std::sync::atomic::{AtomicU8, Ordering, AtomicI8, AtomicUsize, AtomicPtr};
+use std::sync::atomic::{AtomicU8, Ordering, AtomicI8, AtomicUsize};
 
-use array_math::ArrayOps;
 use vst::prelude::PluginParameters;
 use vst::util::AtomicFloat;
 

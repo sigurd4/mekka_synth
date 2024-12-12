@@ -1,7 +1,6 @@
 use std::f64::EPSILON;
 use std::f64::consts::{PI, FRAC_2_PI, TAU};
 
-use array_math::ArrayOps;
 use num::Complex;
 use rand::distributions::Standard;
 use rand::prelude::Distribution;
@@ -42,7 +41,7 @@ impl Waveform
         let d = TAU*duty_cycle.max(0.0).min(1.0);
         match self
         {
-            Waveform::Sine => ArrayOps::fill(|m| {
+            Waveform::Sine => core::array::from_fn(|m| {
                 if d == PI
                 {
                     return (0.0, if m == 0 {1.0} else {0.0})
@@ -59,7 +58,7 @@ impl Waveform
                     -g*(dn.cos() + 1.0)
                 )
             }),
-            Waveform::Triangle => ArrayOps::fill(|m| {
+            Waveform::Triangle => core::array::from_fn(|m| {
                 let n = m + 1;
                 if d == 0.0
                 {
@@ -76,7 +75,7 @@ impl Waveform
                     g*dn.sin()
                 )
             }),
-            Waveform::Sawtooth => ArrayOps::fill(|m| {
+            Waveform::Sawtooth => core::array::from_fn(|m| {
                 let n = m + 1;
                 if d == 0.0 || d == TAU
                 {
@@ -94,7 +93,7 @@ impl Waveform
                     FRAC_2_PI/n as f64*(g*dn.sin() - 1.0 - dn.cos())
                 )
             }),
-            Waveform::Square => ArrayOps::fill(|m| {
+            Waveform::Square => core::array::from_fn(|m| {
                 let n = m + 1;
                 let g = 2.0/(PI*n as f64);
                 if g.is_nan()

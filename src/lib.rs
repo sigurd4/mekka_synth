@@ -7,19 +7,21 @@
 #![feature(int_roundings)]
 #![feature(lazy_cell)]
 
-use std::cell::LazyCell;
-use std::collections::{BTreeSet, BTreeMap};
+use core::f64::consts::FRAC_1_SQRT_2;
+use core::ops::Add;
+use std::collections::BTreeMap;
 use std::f64::{EPSILON, INFINITY};
 use std::f64::consts::TAU;
-use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{Ordering, AtomicU8, AtomicI8, AtomicUsize};
 use std::{vec, fs};
 
-use array_math::ArrayOps;
 use num::rational::Ratio;
+use num::Float;
 use parameters::{SelectionParameters, EnvelopeParameters, OscillatorParameters, RoutingParameters, LFOParameters, FilterParameters};
-use real_time_fir_iir_filters::Filter;
+use real_time_fir_iir_filters::iir::first::Omega;
+use real_time_fir_iir_filters::iir::second::OmegaZeta;
+use real_time_fir_iir_filters::rtf::Rtf;
 use serde_scala::{Scale, SerdeScalaError};
 use tuning::Tuning;
 use vst::channels::{ChannelInfo, SpeakerArrangementType, StereoChannel, StereoConfig};
@@ -30,7 +32,6 @@ use self::envelope::ADSREnvelope;
 use self::lfo::LFO;
 use self::oscillator::Oscillator;
 use self::parameters::{MekkaSynthParameters, Control};
-use self::waveform::Waveform;
 
 moddef::moddef!(
     flat(pub) mod {
@@ -307,21 +308,408 @@ impl MekkaSynthPlugin
         }
         loop
         {
-            match self.repress.last()
+            if let Some(n) = self.repress.pop()
             {
-                Some(&n) => {
-                    self.repress.pop();
-                    if self.pressed.contains(&n)
-                    {
-                        self.press_note(n.0, n.1); return;
-                    }
-                },
-                _ => return
+                if self.pressed.contains(&n)
+                {
+                    self.press_note(n.0, n.1); return;
+                }
             }
         }
     }
+
+    fn unpress_all(&mut self)
+    {
+        self.repress.clear();
+        while let Some(note) = self.pressed.pop()
+        {
+            self.unpress_note(note.0)
+        }
+    }
+
+    fn process<F>(&mut self, buffer: &mut AudioBuffer<F>)
+    where
+        F: Float
+    {
+        if let Some(tuning_name) = self.param.tuning_name()
+        {
+            if self.tuning_name.as_ref() != Some(tuning_name)
+            {
+                if let Some(tuning) = Self::fetch_scale(&self.param.scales, tuning_name).unwrap()
+                {
+                    self.tuning = Tuning::from_scale(tuning);
+                    self.tuning_name = Some(tuning_name.clone());
+                }
+            }
+        }
+
+        let filter_frequency_max = self.rate/2.0;
+        self.param.filter_frequency_max.set(filter_frequency_max as f32);
+
+        let poly = self.param.polyphony.load(Ordering::Relaxed) as usize;
+        let vol = self.param.volume.get() as f64;
+        let change_f = (-1.0/self.param.portamento.get() as f64/self.rate).exp();
+
+        let filter_type = self.param.filter.type_.load(Ordering::Relaxed) as usize;
+
+        let waveform = self.param.osc.each_ref()
+            .map(|osc| osc.waveform());
+        let duty_cycle = self.param.osc.each_ref()
+            .map(|osc| osc.duty_cycle.get() as f64);
+        let mix = self.param.osc.each_ref()
+            .map(|osc| osc.mix.get() as f64);
+        let pan = self.param.osc.each_ref()
+            .map(|osc| osc.pan.get() as f64);
+        let detune = self.param.osc.each_ref()
+            .map(|osc| osc.detune.get() as f64 + self.pitch + 12.0*osc.octave.load(Ordering::Relaxed) as f64);
+        
+        let env_vcf = self.param.envelope.each_ref()
+            .map(|env| env.routing.vcf.get() as f64);
+        let env_vco = self.param.envelope.each_ref()
+            .map(|env| env.routing.vco.get() as f64);
+        let env_vca = self.param.envelope.each_ref()
+            .map(|env| env.routing.vca.get() as f64);
+        let env_vclfo = self.param.envelope.each_ref()
+            .map(|env| env.routing.vclfo.each_ref().map(|vclfo| vclfo.get() as f64));
+
+        let lfo_vcf = self.param.lfo.each_ref()
+            .map(|lfo| lfo.routing.vcf.get() as f64);
+        let lfo_vco = self.param.lfo.each_ref()
+            .map(|lfo| lfo.routing.vco.get() as f64);
+        let lfo_vca = self.param.lfo.each_ref()
+            .map(|lfo| lfo.routing.vca.get() as f64);
+        let lfo_vclfo = self.param.lfo.each_ref()
+            .map(|lfo| lfo.routing.vclfo.each_ref().map(|vclfo| vclfo.get() as f64));
+
+        let mix_mode = self.param.mix_mode.load(Ordering::Relaxed);
+        let mixtot = if mix_mode == 2
+        {
+            mix.into_iter().sum::<f64>()
+        }
+        else
+        {
+            1.0
+        };
+
+        let lfo_dtc = self.param.lfo.each_ref()
+            .map(|lfo| lfo.duty_cycle.get() as f64);
+
+        self.pitch = PITCH_CHANGE*self.pitch_control + (1.0 - PITCH_CHANGE)*self.pitch;
+        for (lfo, params) in self.lfo.iter_mut()
+            .zip(self.param.lfo.iter())
+        {
+            lfo.waveform = params.waveform();
+        }
+        
+        for i in 0..poly
+        {
+            for c in 0..CHANNEL_COUNT
+            {
+                self.filter[c][i].param.zeta.assign(FILTER_CHANGE*0.5/(self.param.filter.resonance.get() as f64 + EPSILON) + (1.0 - FILTER_CHANGE)**self.filter[c][i].param.zeta);
+            }
+        }
+
+        let samples = buffer.samples();
+        let (_, mut outputs) = buffer.split();
+        
+        {
+            for (osc, env) in self.osc.iter_mut()
+                .zip(self.env.iter_mut())
+            {
+                for (osc, (waveform, duty_cycle)) in osc.iter_mut()
+                    .zip(waveform.into_iter().zip(duty_cycle))
+                {
+                    osc.set_waveform(waveform, duty_cycle);
+                }
+
+                for (env, params) in env.iter_mut()
+                    .zip(self.param.envelope.iter())
+                {
+                    env.set_parameters(params)
+                }
+            }
+        }
+        let mut g: [[Vec<f64>; ENVELOPE_COUNT]; POLY_MAX] = [(); _].map(|()| [(); _].map(|()| vec![0.0; samples]));
+
+        let y: Vec<[f64; CHANNEL_COUNT]> = (0..samples).map(|s| {
+            let lfo: [f64; LFO_COUNT] = core::array::from_fn(|n| 
+                self.filter_lfo[n].filter(self.rate, self.lfo[n].next(self.rate, lfo_dtc[n]))[0]
+            );
+
+            for i in 0..poly
+            {
+                let (note, detune_note) = self.notes_held[i];
+                
+                for n in 0..ENVELOPE_COUNT
+                {
+                    g[i][n][s] = self.filter_env[i][n].filter(self.rate, self.env[i][n].next(self.rate))[0];
+                }
+                for n in 0..OSCILLATOR_COUNT
+                {
+                    let detune = g[i].iter()
+                        .zip(env_vco)
+                        .map(|(g, env_vco)| (1.0 - g[s])*env_vco)
+                        .chain(lfo.iter()
+                            .zip(lfo_vco)
+                            .map(|(lfo, lfo_vco)| lfo.clamp(-1.0, 1.0)*lfo_vco)
+                        ).fold(detune[n], Add::add);
+                
+                    self.osc[i][n].note = (self.tuning.note(note) + Self::note_offset_with_key(self.param.key.load(Ordering::Relaxed)) as f64 + detune_note)*(1.0 - change_f)
+                        + (self.osc[i][n].note - detune)*change_f
+                        + detune
+                }
+
+                let f0 = self.param.filter.frequency.get() as f64;
+
+                let a0 = env_vcf.iter()
+                    .chain(lfo_vcf.iter())
+                    .map(|&x| x.abs())
+                    .sum::<f64>();
+                let f = if a0.abs() < EPSILON
+                {
+                    f0
+                }
+                else
+                {
+                    env_vcf.iter()
+                        .copied()
+                        .zip(g[i].iter())
+                        .map(|(env_vcf, g)| env_vcf.abs()/a0*if env_vcf >= 0.0
+                    {
+                        (f0.log2()*((1.0 - env_vcf) + g[s]*env_vcf)
+                        + filter_frequency_max.log2()*(1.0 - g[s])*env_vcf).exp2()
+                    }
+                    else
+                    {
+                        (f0.log2()*((1.0 + env_vcf) - g[s]*env_vcf)
+                        - FILTER_FREQUENCY_MIN.log2()*(1.0 - g[s])*env_vcf).exp2()
+                    }).chain(lfo_vcf.iter()
+                            .map(|&lfo_vcf| lfo_vcf as f64)
+                            .zip(lfo.iter()).map(|(lfo_vcf, &lfo)| lfo_vcf.abs()/a0*if lfo_vcf >= 0.0
+                        {
+                            (f0.log2()*((1.0 - lfo_vcf) + (0.5*lfo + 0.5)*lfo_vcf)
+                            + filter_frequency_max.log2()*(0.5 - 0.5*lfo)*lfo_vcf).exp2()
+                        }
+                        else
+                        {
+                            (f0.log2()*((1.0 + lfo_vcf) - (0.5*lfo + 0.5)*lfo_vcf)
+                            - FILTER_FREQUENCY_MIN.log2()*(0.5 - 0.5*lfo)*lfo_vcf).exp2()
+                        })
+                    ).sum::<f64>()
+                };
+
+                for c in 0..CHANNEL_COUNT
+                {
+                    self.filter[c][i].param.omega.assign(FILTER_CHANGE*TAU*f + (1.0 - FILTER_CHANGE)**self.filter[c][i].param.omega);
+                }
+            }
+            for i in poly..POLY_MAX
+            {
+                for n in 0..ENVELOPE_COUNT
+                {
+                    self.env[i][n].next(self.rate);
+                }
+            }
+            let g0: [f64; ENVELOPE_COUNT] = core::array::from_fn(|i| g.iter()
+                .map(|g| g[i][s])
+                .reduce(|a, b| a.max(b))
+                .unwrap_or(1.0)
+            );
+            for n in 0..LFO_COUNT
+            {
+                let f0 = self.param.lfo[n].frequency.get() as f64;
+                
+                let a0 = env_vclfo.iter()
+                    .chain(lfo_vclfo.iter())
+                    .map(|x| x[n].abs())
+                    .sum::<f64>();
+                let f = if a0 == 0.0 || a0 == -0.0
+                {
+                    f0
+                }
+                else
+                {
+                    env_vclfo.iter()
+                        .map(|env_vclfo| env_vclfo[n] as f64)
+                        .zip(g0.into_iter())
+                        .map(|(env_vclfo, g0)| env_vclfo.abs()/a0*if env_vclfo >= 0.0
+                    {
+                        (f0.log2()*((1.0 - env_vclfo) + g0*env_vclfo)
+                        + LFO_FREQUENCY_MAX.log2()*(1.0 - g0)*env_vclfo).exp2()
+                    }
+                    else
+                    {
+                        (f0.log2()*((1.0 + env_vclfo) - g0*env_vclfo)
+                        - LFO_FREQUENCY_MIN.log2()*(1.0 - g0)*env_vclfo).exp2()
+                    }).chain(lfo_vclfo.iter()
+                            .map(|lfo_vclfo| lfo_vclfo[n] as f64)
+                            .zip(lfo.into_iter())
+                            .map(|(lfo_vclfo, lfo)| lfo_vclfo.abs()/a0*if lfo_vclfo >= 0.0
+                        {
+                            (f0.log2()*((1.0 - lfo_vclfo) + (0.5*lfo + 0.5)*lfo_vclfo)
+                            + LFO_FREQUENCY_MAX.log2()*(0.5 - 0.5*lfo)*lfo_vclfo).exp2()
+                        }
+                        else
+                        {
+                            (f0.log2()*((1.0 + lfo_vclfo) - (0.5*lfo + 0.5)*lfo_vclfo)
+                            - LFO_FREQUENCY_MIN.log2()*(0.5 - 0.5*lfo)*lfo_vclfo).exp2()
+                        })
+                    ).sum::<f64>()
+                };
+                
+                self.lfo[n].omega = TAU*f;
+            }
+            for i in 0..poly
+            {
+                for n in 0..ENVELOPE_COUNT
+                {
+                    g[i][n][s] = 1.0 + (g[i][n][s] - 1.0)*env_vca[n];
+                }
+            }
+            if mix_mode == 1
+            {
+                for i in 0..poly
+                {
+                    if self.osc[i][0].theta >= TAU*(1.0 - self.osc[i][0].omega()/self.rate)
+                    {
+                        for n in 1..OSCILLATOR_COUNT
+                        {
+                            self.osc[i][n].theta = self.osc[i][0].theta;
+                        }
+                    }
+                }
+            }
+            let y: [f64; CHANNEL_COUNT] = (0..poly).map(|i| {
+                        let y: [f64; CHANNEL_COUNT] = (0..OSCILLATOR_COUNT).map(|n| {
+                                let g_tot = (0..ENVELOPE_COUNT).map(|m| g[i][m][s]).product::<f64>();
+                                if g_tot == 0.0 || (mix[n] == 0.0 && mix_mode != 2)
+                                {
+                                    self.osc[i][n].step(self.rate);
+                                    [0.0, 0.0]
+                                }
+                                else
+                                {
+                                    let mut y = mix[n]*self.osc[i][n].next(self.rate);
+                                    if mix_mode == 2
+                                    {
+                                        y += 1.0 - mix[n]
+                                    }
+                                    y *= g_tot*lfo_vca.iter()
+                                        .zip(lfo.iter())
+                                        .map(|(&lfo_vca, &lfo)|
+                                            1.0 - lfo_vca.abs() + lfo_vca.abs()*(0.5 + lfo_vca.signum()*lfo).max(0.0)
+                                        ).product::<f64>();
+                                    
+                                    let p = pan[n] as f64;
+                                    [(1.0 - p)*y, p*y]
+                                }
+                            })
+                            .reduce(if mix_mode != 2
+                                {
+                                    |mut a: [f64; CHANNEL_COUNT], b: [f64; CHANNEL_COUNT]| {
+                                        for (a, b) in a.iter_mut()
+                                            .zip(b)
+                                        {
+                                            *a += b
+                                        }
+                                        a
+                                    }
+                                }
+                                else
+                                {
+                                    |mut a: [f64; CHANNEL_COUNT], b: [f64; CHANNEL_COUNT]| {
+                                        for (a, b) in a.iter_mut()
+                                            .zip(b)
+                                        {
+                                            *a *= b
+                                        }
+                                        a
+                                    }
+                                }
+                            ).unwrap_or([0.0, 0.0]);
+                        core::array::from_fn(|c| self.filter[c][i].filter(self.rate, y[c])[filter_type])
+                    })
+                    .reduce(|mut a: [f64; 2], b| {
+                        for (a, b) in a.iter_mut()
+                            .zip(b)
+                        {
+                            *a += b
+                        }
+                        a
+                    })
+                    .unwrap_or([0.0, 0.0]);
+            [GAIN*vol*y[0]*mixtot, GAIN*vol*y[1]*mixtot]
+        }).collect();
+
+        for (c, output_channel) in outputs.into_iter().enumerate()
+        {
+            for (output_sample, &y) in output_channel.into_iter().zip(y.iter())
+            {
+                *output_sample = F::from(y[c]).unwrap()
+            }
+        }
+
+        /*let g0 = g.iter()
+            .map(|v| v.clone())
+            .reduce(|a, b| (0..samples)
+                .map(|s| a[s].max(b[s]))
+                .collect::<Vec<f32>>()
+            ).unwrap();*/
+
+        /*let events: Vec<[*mut Event; POLY_MAX + 1]> = (0..samples).map(|s|
+            core::array::from_fn(|i| {
+                let value = if i == 0
+                {
+                    g0[s]
+                }
+                else
+                {
+                    g[i][s]
+                };
+                let system_data: *mut u8 = &mut value.to_le_bytes()[0];
+                unsafe
+                {
+                    std::mem::transmute(&mut SysExEvent {
+                        event_type: vst::api::EventType::_Trigger,
+                        byte_size: 4,
+                        data_size: 4,
+                        delta_frames: s as i32,
+                        _flags: 0,
+                        _reserved1: 0,
+                        system_data,
+                        _reserved2: 0,
+                    })
+                }
+            })
+        ).collect();
+
+        for s in 0..samples
+        {
+            for i in 0..(POLY_MAX + 1)/2
+            {
+                let events: [*mut Event; 2] = core::array::from_fn(|j| events[s][i*2 + j] as *mut Event);
+                self.host.process_events(&Events {
+                    num_events: 2,
+                    _reserved: 0,
+                    events
+                })
+            }
+        }*/
+
+        /*self.host.begin_edit(0);
+        self.host.automate(0, *g0.last().unwrap_or(&0.0));
+        self.host.end_edit(0);
+
+        for i in 0..POLY_MAX
+        {
+            self.host.begin_edit(i as i32 + 1);
+            self.host.automate(i as i32 + 1, *g[i].last().unwrap_or(&0.0));
+            self.host.end_edit(i as i32 + 1);
+        }*/
+    }
 }
 
+#[allow(deprecated)]
 impl Plugin for MekkaSynthPlugin
 {
     fn new(host: HostCallback) -> Self
@@ -329,7 +717,7 @@ impl Plugin for MekkaSynthPlugin
         Self: Sized
     {
         let filter_frequency_max = 22050.0;
-        let zeta = 0.5f64.sqrt();
+        let zeta = FRAC_1_SQRT_2;
         let waveform = Waveform::Sine;
         let waveform_lfo = Waveform::Triangle;
         let scales = MekkaSynthPlugin::fetch_scales().unwrap();
@@ -348,7 +736,7 @@ impl Plugin for MekkaSynthPlugin
                     envelope: AtomicU8::new(0),
                     vclfo: AtomicU8::new(0)
                 },
-                osc: ArrayOps::fill(|i| OscillatorParameters {
+                osc: core::array::from_fn(|i| OscillatorParameters {
                     waveform: AtomicU8::new(waveform as u8),
                     duty_cycle: AtomicFloat::new(0.5),
                     detune: AtomicFloat::new(0.0),
@@ -356,7 +744,7 @@ impl Plugin for MekkaSynthPlugin
                     mix: AtomicFloat::new(if i == 0 {1.0} else {0.0}),
                     pan: AtomicFloat::new(0.5)
                 }),
-                envelope: ArrayOps::fill(|i| EnvelopeParameters {
+                envelope: core::array::from_fn(|i| EnvelopeParameters {
                     attack: AtomicFloat::new(ATTACK_MIN as f32),
                     decay: AtomicFloat::new(DECAY_MIN as f32),
                     sustain: AtomicFloat::new(1.0),
@@ -404,9 +792,9 @@ impl Plugin for MekkaSynthPlugin
             pressed: vec![],
             pitch: 0.0,
             pitch_control: 0.0,
-            filter_env: [[FirstOrderFilter::new(TAU*100.0); ENVELOPE_COUNT]; POLY_MAX],
-            filter_lfo: [FirstOrderFilter::new(TAU*100.0); LFO_COUNT],
-            filter: [[SecondOrderFilter::new(TAU*filter_frequency_max, zeta); POLY_MAX]; CHANNEL_COUNT],
+            filter_env: [[FirstOrderFilter::new(Omega::new(TAU*100.0)); ENVELOPE_COUNT]; POLY_MAX],
+            filter_lfo: [FirstOrderFilter::new(Omega::new(TAU*100.0)); LFO_COUNT],
+            filter: [[SecondOrderFilter::new(OmegaZeta::new(TAU*filter_frequency_max, zeta)); POLY_MAX]; CHANNEL_COUNT],
             rate: 44100.0
         }
     }
@@ -519,374 +907,40 @@ impl Plugin for MekkaSynthPlugin
 
     fn process(&mut self, buffer: &mut AudioBuffer<f32>)
     {
-        if let Some(tuning_name) = self.param.tuning_name()
+        self.process(buffer)
+    }
+
+    fn process_f64(&mut self, buffer: &mut AudioBuffer<f64>)
+    {
+        self.process(buffer)
+    }
+
+    fn get_tail_size(&self) -> isize
+    {
+        2
+    }
+
+    fn suspend(&mut self)
+    {
+        for filter in self.filter.iter_mut()
         {
-            if self.tuning_name.as_ref() != Some(tuning_name)
+            for filter in filter.iter_mut()
             {
-                if let Some(tuning) = Self::fetch_scale(&self.param.scales, tuning_name).unwrap()
-                {
-                    self.tuning = Tuning::from_scale(tuning);
-                    self.tuning_name = Some(tuning_name.clone());
-                }
+                filter.reset()
             }
         }
-
-        let filter_frequency_max = self.rate/2.0;
-        self.param.filter_frequency_max.set(filter_frequency_max as f32);
-
-        let poly = self.param.polyphony.load(Ordering::Relaxed) as usize;
-        let vol = self.param.volume.get();
-        let change_f = (-1.0/self.param.portamento.get() as f64/self.rate).exp();
-
-        let filter_type = self.param.filter.type_.load(Ordering::Relaxed) as usize;
-
-        let waveform = self.param.osc.each_ref()
-            .map(|osc| osc.waveform());
-        let duty_cycle = self.param.osc.each_ref()
-            .map(|osc| osc.duty_cycle.get());
-        let mix = self.param.osc.each_ref()
-            .map(|osc| osc.mix.get());
-        let pan = self.param.osc.each_ref()
-            .map(|osc| osc.pan.get());
-        let detune = self.param.osc.each_ref()
-            .map(|osc| osc.detune.get() as f64 + self.pitch + 12.0*osc.octave.load(Ordering::Relaxed) as f64);
-        
-        let env_vcf = self.param.envelope.each_ref()
-            .map(|env| env.routing.vcf.get());
-        let env_vco = self.param.envelope.each_ref()
-            .map(|env| env.routing.vco.get());
-        let env_vca = self.param.envelope.each_ref()
-            .map(|env| env.routing.vca.get());
-        let env_vclfo = self.param.envelope.each_ref()
-            .map(|env| env.routing.vclfo.each_ref().map(|vclfo| vclfo.get()));
-
-        let lfo_vcf = self.param.lfo.each_ref()
-            .map(|lfo| lfo.routing.vcf.get());
-        let lfo_vco = self.param.lfo.each_ref()
-            .map(|lfo| lfo.routing.vco.get());
-        let lfo_vca = self.param.lfo.each_ref()
-            .map(|lfo| lfo.routing.vca.get());
-        let lfo_vclfo = self.param.lfo.each_ref()
-            .map(|lfo| lfo.routing.vclfo.each_ref().map(|vclfo| vclfo.get()));
-
-        let mix_mode = self.param.mix_mode.load(Ordering::Relaxed);
-
-        let lfo_dtc = self.param.lfo.each_ref()
-            .map(|lfo| lfo.duty_cycle.get());
-
-        self.pitch = PITCH_CHANGE*self.pitch_control + (1.0 - PITCH_CHANGE)*self.pitch;
-        for (lfo, params) in self.lfo.each_mut()
-            .zip(self.param.lfo.each_ref())
+        for filter in self.filter_env.iter_mut()
         {
-            lfo.waveform = params.waveform();
-        }
-        
-        for i in 0..poly
-        {
-            for c in 0..CHANNEL_COUNT
+            for filter in filter.iter_mut()
             {
-                self.filter[c][i].zeta = FILTER_CHANGE*0.5/(self.param.filter.resonance.get() as f64 + EPSILON) + (1.0 - FILTER_CHANGE)*self.filter[c][i].zeta;
+                filter.reset()
             }
         }
-
-        let samples = buffer.samples();
-        let (_, mut outputs) = buffer.split();
-        
+        for filter in self.filter_lfo.iter_mut()
         {
-            for (osc, env) in self.osc.iter_mut()
-                .zip(self.env.iter_mut())
-            {
-                for (osc, (waveform, duty_cycle)) in osc.each_mut()
-                    .zip(waveform.zip(duty_cycle))
-                {
-                    osc.set_waveform(waveform, duty_cycle as f64);
-                }
-
-                for (env, params) in env.each_mut()
-                    .zip(self.param.envelope.each_ref())
-                {
-                    env.set_parameters(params)
-                }
-            }
+            filter.reset()
         }
-        let mut g: [[Vec<f64>; ENVELOPE_COUNT]; POLY_MAX] = [(); _].map(|()| [(); _].map(|()| vec![0.0; samples]));
-
-        let y: Vec<[f64; CHANNEL_COUNT]> = (0..samples).map(|s| {
-            let lfo: [f64; LFO_COUNT] = ArrayOps::fill(|n| 
-                self.filter_lfo[n].filter(self.rate, self.lfo[n].next(self.rate, lfo_dtc[n] as f64))[0]
-            );
-
-            for i in 0..poly
-            {
-                let (note, detune_note) = self.notes_held[i];
-                
-                for n in 0..ENVELOPE_COUNT
-                {
-                    g[i][n][s] = self.filter_env[i][n].filter(self.rate, self.env[i][n].next(self.rate))[0];
-                }
-                for n in 0..OSCILLATOR_COUNT
-                {
-                    let detune = detune[n]
-                        + (0..ENVELOPE_COUNT).map(|m| (1.0 - g[i][m][s])*env_vco[m] as f64).reduce(|a, b| a + b).unwrap_or(0.0)
-                        + (0..LFO_COUNT).map(|m| lfo[m].max(-1.0).min(1.0)*lfo_vco[m] as f64).reduce(|a, b| a + b).unwrap_or(0.0);
-                
-                    self.osc[i][n].note = (self.tuning.note(note) + Self::note_offset_with_key(self.param.key.load(Ordering::Relaxed)) as f64 + detune_note)*(1.0 - change_f)
-                        + (self.osc[i][n].note - detune)*change_f
-                        + detune
-                }
-
-                let f0 = self.param.filter.frequency.get() as f64;
-
-                let a0 = (0..ENVELOPE_COUNT)
-                    .map(|m| env_vcf[m].abs() as f64)
-                    .reduce(|a, b| a + b)
-                    .unwrap_or(0.0)
-                    + (0..LFO_COUNT)
-                    .map(|m| lfo_vcf[m].abs() as f64)
-                    .reduce(|a, b| a + b)
-                    .unwrap_or(0.0);
-                let f = if a0 == 0.0 || a0 == -0.0
-                {
-                    f0
-                }
-                else
-                {
-                    env_vcf.iter()
-                        .map(|&env_vcf| env_vcf as f64)
-                        .zip(g[i].iter())
-                        .map(|(env_vcf, g)| env_vcf.abs()/a0*if env_vcf >= 0.0
-                    {
-                        (f0.log2()*((1.0 - env_vcf) + g[s]*env_vcf)
-                        + filter_frequency_max.log2()*(1.0 - g[s])*env_vcf).exp2()
-                    }
-                    else
-                    {
-                        (f0.log2()*((1.0 + env_vcf) - g[s]*env_vcf)
-                        - FILTER_FREQUENCY_MIN.log2()*(1.0 - g[s])*env_vcf).exp2()
-                    }).reduce(|a, b| a + b)
-                    .unwrap_or(0.0)
-                    + lfo_vcf.iter()
-                        .map(|&lfo_vcf| lfo_vcf as f64)
-                        .zip(lfo.iter()).map(|(lfo_vcf, &lfo)| lfo_vcf.abs()/a0*if lfo_vcf >= 0.0
-                    {
-                        (f0.log2()*((1.0 - lfo_vcf) + (0.5*lfo + 0.5)*lfo_vcf)
-                        + filter_frequency_max.log2()*(0.5 - 0.5*lfo)*lfo_vcf).exp2()
-                    }
-                    else
-                    {
-                        (f0.log2()*((1.0 + lfo_vcf) - (0.5*lfo + 0.5)*lfo_vcf)
-                        - FILTER_FREQUENCY_MIN.log2()*(0.5 - 0.5*lfo)*lfo_vcf).exp2()
-                    }).reduce(|a, b| a + b)
-                    .unwrap_or(0.0)
-                };
-
-                for c in 0..CHANNEL_COUNT
-                {
-                    self.filter[c][i].omega = FILTER_CHANGE*TAU*f + (1.0 - FILTER_CHANGE)*self.filter[c][i].omega;
-                }
-            }
-            for i in poly..POLY_MAX
-            {
-                for n in 0..ENVELOPE_COUNT
-                {
-                    self.env[i][n].next(self.rate);
-                }
-            }
-            let g0: [f64; ENVELOPE_COUNT] = ArrayOps::fill(|i| g.iter()
-                .map(|g| g[i][s])
-                .reduce(|a, b| a.max(b))
-                .unwrap_or(1.0));
-            for n in 0..LFO_COUNT
-            {
-                let f0 = self.param.lfo[n].frequency.get() as f64;
-                
-                let a0 = env_vclfo.iter()
-                    .map(|x| x[n].abs() as f64)
-                    .reduce(|a, b| a + b)
-                    .unwrap_or(0.0)
-                    + lfo_vclfo.iter()
-                        .map(|x| x[n].abs() as f64)
-                        .reduce(|a, b| a + b)
-                        .unwrap_or(0.0);
-                let f = if a0 == 0.0 || a0 == -0.0
-                {
-                    f0
-                }
-                else
-                {
-                    env_vclfo.iter()
-                        .map(|env_vclfo| env_vclfo[n] as f64)
-                        .zip(g0.into_iter())
-                        .map(|(env_vclfo, g0)| env_vclfo.abs()/a0*if env_vclfo >= 0.0
-                    {
-                        (f0.log2()*((1.0 - env_vclfo) + g0*env_vclfo)
-                        + LFO_FREQUENCY_MAX.log2()*(1.0 - g0)*env_vclfo).exp2()
-                    }
-                    else
-                    {
-                        (f0.log2()*((1.0 + env_vclfo) - g0*env_vclfo)
-                        - LFO_FREQUENCY_MIN.log2()*(1.0 - g0)*env_vclfo).exp2()
-                    }).reduce(|a, b| a + b).unwrap_or(0.0)
-                    + 
-                    lfo_vclfo.iter()
-                        .map(|lfo_vclfo| lfo_vclfo[n] as f64)
-                        .zip(lfo.into_iter())
-                        .map(|(lfo_vclfo, lfo)| lfo_vclfo.abs()/a0*if lfo_vclfo >= 0.0
-                    {
-                        (f0.log2()*((1.0 - lfo_vclfo) + (0.5*lfo + 0.5)*lfo_vclfo)
-                        + LFO_FREQUENCY_MAX.log2()*(0.5 - 0.5*lfo)*lfo_vclfo).exp2()
-                    }
-                    else
-                    {
-                        (f0.log2()*((1.0 + lfo_vclfo) - (0.5*lfo + 0.5)*lfo_vclfo)
-                        - LFO_FREQUENCY_MIN.log2()*(0.5 - 0.5*lfo)*lfo_vclfo).exp2()
-                    }).reduce(|a, b| a + b).unwrap_or(0.0)
-                };
-                
-                self.lfo[n].omega = TAU*f;
-            }
-            for i in 0..poly
-            {
-                for n in 0..ENVELOPE_COUNT
-                {
-                    g[i][n][s] = 1.0 - env_vca[n] as f64 + env_vca[n] as f64*g[i][n][s];
-                }
-            }
-            if mix_mode == 1
-            {
-                for i in 0..poly
-                {
-                    if self.osc[i][0].theta >= TAU*(1.0 - self.osc[i][0].omega()/self.rate)
-                    {
-                        for n in 1..OSCILLATOR_COUNT
-                        {
-                            self.osc[i][n].theta = self.osc[i][0].theta;
-                        }
-                    }
-                }
-            }
-            let y: [f64; CHANNEL_COUNT] = (0..poly).map(|i| {
-                        let y: [f64; CHANNEL_COUNT] = (0..OSCILLATOR_COUNT).map(|n| {
-                                let g_tot = (0..ENVELOPE_COUNT).map(|m| g[i][m][s]).reduce(|a, b| a*b).unwrap_or(1.0);
-                                if g_tot == 0.0 || (mix[n] == 0.0 && mix_mode != 2)
-                                {
-                                    self.osc[i][n].step(self.rate);
-                                    [0.0, 0.0]
-                                }
-                                else
-                                {
-                                    let y = g_tot
-                                    *if mix_mode != 2
-                                    {
-                                        mix[n] as f64*self.osc[i][n].next(self.rate)
-                                    }
-                                    else
-                                    {
-                                        mix[n] as f64*self.osc[i][n].next(self.rate) + (1.0 - mix[n] as f64)
-                                    }
-                                    *lfo_vca.iter()
-                                        .map(|&lfo_vca| lfo_vca as f64)
-                                        .zip(lfo.iter())
-                                        .map(|(lfo_vca, lfo)|
-                                            1.0 - lfo_vca.abs() + lfo_vca.abs()*(0.5 + lfo_vca.signum()*lfo).max(0.0)
-                                        ).reduce(|a, b| a*b)
-                                        .unwrap_or(1.0);
-                                    
-                                    let p = pan[n] as f64;
-                                    [(1.0 - p)*y, p*y]
-                                }
-                            })
-                            .reduce(if mix_mode != 2
-                                {
-                                    |a: [f64; CHANNEL_COUNT], b: [f64; CHANNEL_COUNT]|
-                                        ArrayOps::fill(|n| a[n] + b[n])
-                                }
-                                else
-                                {
-                                    |a: [f64; CHANNEL_COUNT], b: [f64; CHANNEL_COUNT]|
-                                        ArrayOps::fill(|n| a[n] * b[n])
-                                }
-                            ).unwrap_or([0.0, 0.0]);
-                        return ArrayOps::fill(|c| self.filter[c][i].filter(self.rate, y[c])[filter_type])
-                    })
-                    .reduce(|a: [f64; 2], b| a.add_each(b))
-                    .unwrap_or([0.0, 0.0]);
-            if mix_mode != 2
-            {
-                [GAIN*vol as f64*y[0], GAIN*vol as f64*y[1]]
-            }
-            else
-            {
-                let mixtot = mix.into_iter().reduce(|a, b| a + b).unwrap_or(0.0) as f64;
-                [GAIN*vol as f64*y[0]*mixtot, GAIN*vol as f64*y[1]*mixtot]
-            }
-        }).collect();
-
-        for (c, output_channel) in outputs.into_iter().enumerate()
-        {
-            for (output_sample, &y) in output_channel.into_iter().zip(y.iter())
-            {
-                *output_sample = y[c] as f32
-            }
-        }
-
-        /*let g0 = g.iter()
-            .map(|v| v.clone())
-            .reduce(|a, b| (0..samples)
-                .map(|s| a[s].max(b[s]))
-                .collect::<Vec<f32>>()
-            ).unwrap();*/
-
-        /*let events: Vec<[*mut Event; POLY_MAX + 1]> = (0..samples).map(|s|
-            ArrayOps::fill(|i| {
-                let value = if i == 0
-                {
-                    g0[s]
-                }
-                else
-                {
-                    g[i][s]
-                };
-                let system_data: *mut u8 = &mut value.to_le_bytes()[0];
-                unsafe
-                {
-                    std::mem::transmute(&mut SysExEvent {
-                        event_type: vst::api::EventType::_Trigger,
-                        byte_size: 4,
-                        data_size: 4,
-                        delta_frames: s as i32,
-                        _flags: 0,
-                        _reserved1: 0,
-                        system_data,
-                        _reserved2: 0,
-                    })
-                }
-            })
-        ).collect();
-
-        for s in 0..samples
-        {
-            for i in 0..(POLY_MAX + 1)/2
-            {
-                let events: [*mut Event; 2] = ArrayOps::fill(|j| events[s][i*2 + j] as *mut Event);
-                self.host.process_events(&Events {
-                    num_events: 2,
-                    _reserved: 0,
-                    events
-                })
-            }
-        }*/
-
-        /*self.host.begin_edit(0);
-        self.host.automate(0, *g0.last().unwrap_or(&0.0));
-        self.host.end_edit(0);
-
-        for i in 0..POLY_MAX
-        {
-            self.host.begin_edit(i as i32 + 1);
-            self.host.automate(i as i32 + 1, *g[i].last().unwrap_or(&0.0));
-            self.host.end_edit(i as i32 + 1);
-        }*/
+        self.unpress_all();
     }
 
     fn get_parameter_object(&mut self) -> Arc<dyn PluginParameters>

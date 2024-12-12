@@ -43,7 +43,7 @@ impl Oscillator
         let omega_norm = self.omega()/rate*self.waveform.omega_mul();
         let y = self.waveform(omega_norm);
         self.step(rate);
-        return y
+        y
     }
 
     pub fn set_waveform(&mut self, waveform: Waveform, duty_cycle: f64)
@@ -67,19 +67,19 @@ impl Oscillator
         match self.waveform
         {
             Waveform::Sine => {
-                return Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta);
+                Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta)
             },
             Waveform::Triangle => {
-                return Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta);
+                Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta)
             },
             Waveform::Sawtooth => {
-                return Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta);
+                Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta)
             },
             Waveform::Square => {
-                return Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta);
+                Waveform::waveform_wavetable(&self.wavetable[..n_max], self.theta)
             },
             Waveform::Noise => {
-                return self.waveform.waveform_direct(self.theta, self.duty_cycle);
+                self.waveform.waveform_direct(self.theta, self.duty_cycle)
             },
         }
     }

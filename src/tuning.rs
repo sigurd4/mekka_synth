@@ -1,6 +1,4 @@
-use std::collections::BTreeSet;
-
-use num::{rational::Ratio, Float, complex::ComplexFloat};
+use num::rational::Ratio;
 use serde_scala::{Scale, Pitch};
 
 const C4: i32 = 44;

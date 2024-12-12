@@ -8,10 +8,9 @@ edition = "2021"
 [dependencies]
 moddef = "0.2.2"
 vst = "0.4.0"
-real_time_fir_iir_filters = "0.6.7"
-array_math = "0.2.6"
+real_time_fir_iir_filters = "1.0.8"
 rand = "0.8.5"
-num = "0.4.1"
+num = "0.4.3"
 serde_scala = "0.1.2"
 
 [lib]
